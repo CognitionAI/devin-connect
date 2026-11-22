@@ -120,6 +120,25 @@ async fn spawn_connect_proxy(target: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<S
     (addr, authorities)
 }
 
+/// A TCP server that accepts and holds each connection open without ever
+/// writing or closing it.
+async fn spawn_silent_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                // Hold the socket without reading or closing it, so the
+                // peer's FIN is never answered with a close of our own.
+                let _held = stream;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    addr
+}
+
 struct TestGateway {
     addr: SocketAddr,
     metrics: Arc<Metrics>,
@@ -563,6 +582,42 @@ admin_listen: 127.0.0.1:1
     let head = String::from_utf8_lossy(&buf[..n]);
     assert!(head.starts_with("HTTP/1.1 400 Bad Request"), "{head}");
     assert_eq!(gw.metrics.bad_requests_total.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn reaps_half_closed_connection_when_peer_never_closes() {
+    let silent = spawn_silent_server().await;
+    let gw = start_gateway(
+        r#"
+schema_version: 1
+listen: 127.0.0.1:0
+admin_listen: 127.0.0.1:1
+half_close_timeout: 200ms
+routes:
+  - name: local
+    rules: [{ipv4: 127.0.0.0/8}]
+"#,
+    )
+    .await;
+
+    let (status, mut stream) = connect(gw.addr, &format!("127.0.0.1:{}", silent.port())).await;
+    assert_eq!(status, "HTTP/1.1 200 Connection established");
+    stream.write_all(b"ping").await.unwrap();
+    // The client ends its write side; the silent peer never answers the
+    // FIN the splice then sends it.
+    stream.shutdown().await.unwrap();
+
+    let eof = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut buf = [0u8; 16];
+        stream.read(&mut buf).await.unwrap()
+    })
+    .await
+    .expect("half-closed connection should be reaped");
+    assert_eq!(eof, 0);
+    assert_eq!(
+        gw.metrics.connections_reaped_total.load(Ordering::Relaxed),
+        1
+    );
 }
 
 #[tokio::test]

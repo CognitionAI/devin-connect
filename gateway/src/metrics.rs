@@ -11,6 +11,7 @@ pub struct Metrics {
     pub denied_no_route_total: AtomicU64,
     pub bad_requests_total: AtomicU64,
     pub dial_errors_total: AtomicU64,
+    pub connections_reaped_total: AtomicU64,
     pub bytes_client_to_upstream_total: AtomicU64,
     pub bytes_upstream_to_client_total: AtomicU64,
     pub config_reloads_total: AtomicU64,
@@ -51,6 +52,11 @@ impl Metrics {
                 "gateway_dial_errors_total",
                 "Failures resolving or dialing an allowed target.",
                 &self.dial_errors_total,
+            ),
+            counter(
+                "gateway_connections_reaped_total",
+                "Connections reaped after the peer stayed silent past half_close_timeout.",
+                &self.connections_reaped_total,
             ),
             counter(
                 "gateway_bytes_client_to_upstream_total",

@@ -46,6 +46,15 @@ pub struct GatewayConfig {
     #[serde(default = "default_dial_timeout", with = "humantime_serde")]
     pub dial_timeout: Duration,
 
+    /// Silence tolerated on a half-closed connection's surviving direction
+    /// before the splice is reaped. After one side closes, the splice waits
+    /// for the peer to close its side; a peer that never answers the FIN
+    /// otherwise pins the task and the socket in FIN_WAIT-2, leaking a file
+    /// descriptor per connection until the process hits rlimit. Bytes that
+    /// still arrive restart the timer, so only a truly silent drain is cut.
+    #[serde(default = "default_half_close_timeout", with = "humantime_serde")]
+    pub half_close_timeout: Duration,
+
     /// Customer DNS resolution settings.
     #[serde(default)]
     pub dns: DnsConfig,
@@ -62,6 +71,10 @@ pub struct GatewayConfig {
 
 fn default_dial_timeout() -> Duration {
     Duration::from_secs(10)
+}
+
+fn default_half_close_timeout() -> Duration {
+    Duration::from_secs(60)
 }
 
 /// Customer DNS settings. An empty nameserver list means the system resolver.
@@ -260,6 +273,10 @@ impl GatewayConfig {
             self.schema_version,
             SUPPORTED_SCHEMA_VERSION
         );
+        ensure!(
+            !self.half_close_timeout.is_zero(),
+            "half_close_timeout must be positive"
+        );
         match (self.listen, &self.tunnel) {
             (Some(listen), None) => ensure!(
                 listen != self.admin_listen,
@@ -450,6 +467,7 @@ mod tests {
             r#"
 config_version: 42
 dial_timeout: 3s
+half_close_timeout: 45s
 dns:
   nameservers: ["10.0.0.2:53"]
   timeout: 2s
@@ -471,6 +489,13 @@ routes:
         assert_eq!(config.config_version, Some(42));
         assert_eq!(config.routes.len(), 2);
         assert_eq!(config.dns.nameservers.len(), 1);
+        assert_eq!(config.half_close_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn rejects_zero_half_close_timeout() {
+        let err = GatewayConfig::parse(&minimal_config("half_close_timeout: 0s")).unwrap_err();
+        assert!(err.to_string().contains("half_close_timeout"), "{err}");
     }
 
     #[test]

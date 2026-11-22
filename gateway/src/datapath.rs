@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional},
     net::{TcpListener, TcpStream},
     sync::watch,
-    time::timeout,
+    time::{Instant as TokioInstant, Sleep, timeout},
 };
 use tracing::{Instrument, info, info_span, warn};
 
@@ -232,11 +232,13 @@ where
 
     metrics.connections_active.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    let mut counted_stream = CountingStream::new(&mut stream);
-    let mut counted_upstream = CountingStream::new(&mut upstream);
+    let grace = state.config.half_close_timeout;
+    let mut counted_stream = CountingStream::new(HalfCloseDeadline::new(&mut stream, grace));
+    let mut counted_upstream = CountingStream::new(HalfCloseDeadline::new(&mut upstream, grace));
     let result = copy_bidirectional(&mut counted_stream, &mut counted_upstream).await;
     let client_to_upstream = counted_upstream.bytes_written;
     let upstream_to_client = counted_stream.bytes_written;
+    let reaped = counted_stream.inner.expired() || counted_upstream.inner.expired();
     metrics
         .bytes_client_to_upstream_total
         .fetch_add(client_to_upstream, Ordering::Relaxed);
@@ -244,6 +246,11 @@ where
         .bytes_upstream_to_client_total
         .fetch_add(upstream_to_client, Ordering::Relaxed);
     metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
+    if reaped {
+        metrics
+            .connections_reaped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 
     match result {
         Ok(_) => {
@@ -255,6 +262,7 @@ where
                 bytes_client_to_upstream = leftover_to_upstream + client_to_upstream,
                 bytes_upstream_to_client = leftover_to_client + upstream_to_client,
                 duration_ms = started.elapsed().as_millis() as u64,
+                reaped,
                 "connection closed"
             );
         }
@@ -267,12 +275,99 @@ where
                 bytes_client_to_upstream = leftover_to_upstream + client_to_upstream,
                 bytes_upstream_to_client = leftover_to_client + upstream_to_client,
                 duration_ms = started.elapsed().as_millis() as u64,
+                reaped,
                 error = format!("{err:#}"),
                 "connection closed with error"
             );
         }
     }
     Ok(())
+}
+
+/// Bounds the drain after a half-close. `copy_bidirectional` shuts down a
+/// stream's writer once the opposite direction ends, then keeps reading
+/// this side until the peer answers with its own close; a peer that never
+/// answers leaves the socket in FIN_WAIT-2 and the task alive, leaking a
+/// file descriptor per connection until the process hits rlimit. Once
+/// `poll_shutdown` arms the deadline, each read that moves bytes resets
+/// it; if the peer stays silent for `grace`, reads report EOF so the
+/// splice ends and both sockets are dropped.
+struct HalfCloseDeadline<S> {
+    inner: S,
+    grace: Duration,
+    deadline: Option<Pin<Box<Sleep>>>,
+    expired: bool,
+}
+
+impl<S> HalfCloseDeadline<S> {
+    fn new(inner: S, grace: Duration) -> Self {
+        Self {
+            inner,
+            grace,
+            deadline: None,
+            expired: false,
+        }
+    }
+
+    /// True once a shutdown-armed deadline fired and the read side was
+    /// reported closed.
+    fn expired(&self) -> bool {
+        self.expired
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HalfCloseDeadline<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.expired {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(deadline) = this.deadline.as_mut() {
+            if deadline.as_mut().poll(cx).is_ready() {
+                this.expired = true;
+                return Poll::Ready(Ok(()));
+            }
+        }
+        let filled = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() > filled => {
+                // Bytes still arriving: the peer is draining normally, so
+                // the silence deadline restarts from this read.
+                if let Some(deadline) = this.deadline.as_mut() {
+                    deadline.as_mut().reset(TokioInstant::now() + this.grace);
+                }
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HalfCloseDeadline<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        // The splice is done writing to this stream: the peer has `grace`
+        // of silence left to close its side before the socket is reaped.
+        this.deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.grace)));
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
 }
 
 struct CountingStream<S> {
@@ -696,6 +791,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn half_close_deadline_reaps_silent_peer() {
+        let (mut peer, inner) = tokio::io::duplex(16);
+        let mut stream = HalfCloseDeadline::new(inner, Duration::from_millis(200));
+        let mut buf = [0u8; 8];
+
+        // Unarmed: a silent peer leaves reads pending.
+        let pending = timeout(Duration::from_millis(100), stream.read(&mut buf)).await;
+        assert!(pending.is_err());
+
+        // Arming via shutdown starts the silence deadline; bytes that still
+        // arrive restart it and are delivered normally.
+        stream.shutdown().await.unwrap();
+        peer.write_all(b"tail").await.unwrap();
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 4);
+
+        // Once silent past the grace window, reads report a stable EOF.
+        let eof = timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("armed deadline should fire")
+            .unwrap();
+        assert_eq!(eof, 0);
+        assert!(stream.expired());
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
     }
 
     #[tokio::test]
