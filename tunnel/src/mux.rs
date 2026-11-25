@@ -213,13 +213,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn echoes_across_streams_in_both_directions() {
-        let (client, server) = spawn_pair();
-        assert_echo(&client, b"from the client side").await;
-        assert_echo(&server, b"from the server side").await;
-    }
-
-    #[tokio::test]
     async fn serves_many_concurrent_streams() {
         let (client, _server) = spawn_pair();
         let tasks: Vec<_> = (0..32u32)

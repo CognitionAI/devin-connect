@@ -46,6 +46,13 @@ pub struct GatewayConfig {
     #[serde(default = "default_dial_timeout", with = "humantime_serde")]
     pub dial_timeout: Duration,
 
+    /// Once one side of a connection has finished sending, how long the
+    /// other side may stay silent before the gateway closes the connection.
+    /// Without it, a peer that never closes would hold the connection and
+    /// its sockets open forever. `0s` disables the timeout.
+    #[serde(default = "default_half_close_timeout", with = "humantime_serde")]
+    pub half_close_timeout: Duration,
+
     /// Customer DNS resolution settings.
     #[serde(default)]
     pub dns: DnsConfig,
@@ -62,6 +69,10 @@ pub struct GatewayConfig {
 
 fn default_dial_timeout() -> Duration {
     Duration::from_secs(10)
+}
+
+fn default_half_close_timeout() -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 /// Customer DNS settings. An empty nameserver list means the system resolver.

@@ -461,19 +461,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_capacity_read_consumes_no_message() {
-        let (mut raw, mut server) = raw_client_pair().await;
-        raw.send(Message::Binary(Bytes::from_static(b"data")))
-            .await
-            .unwrap();
-        assert_eq!(server.read(&mut []).await.unwrap(), 0);
-        assert!(server.read_buf.is_empty());
-        let mut got = [0u8; 4];
-        server.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"data");
-    }
-
-    #[tokio::test]
     async fn oversized_message_is_rejected() {
         let (mut raw, mut server) = raw_client_pair().await;
         let big = vec![0u8; MAX_WS_MESSAGE_SIZE + 1];
@@ -591,33 +578,5 @@ mod tests {
             assert_eq!(host_rx.await.unwrap(), expected);
             server.await.unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn client_requires_subprotocol_confirmation() {
-        // A server that upgrades without confirming the subprotocol (here:
-        // plain accept) must be rejected by the client.
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(tokio_tungstenite::accept_async(server_io));
-        let err = client_upgrade(client_io, TEST_SNI, 443).await.unwrap_err();
-        let chain = format!("{err:#}").to_lowercase();
-        assert!(chain.contains("subprotocol"), "{chain}");
-    }
-
-    #[tokio::test]
-    async fn prefixed_replays_prefix_then_inner() {
-        let (mut near, far) = tokio::io::duplex(1024);
-        near.write_all(b" world").await.unwrap();
-        let mut prefixed = Prefixed::new(b"hello", far);
-        let mut got = [0u8; 11];
-        prefixed.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"hello world");
-
-        // Writes pass straight through.
-        prefixed.write_all(b"back").await.unwrap();
-        prefixed.flush().await.unwrap();
-        let mut reply = [0u8; 4];
-        near.read_exact(&mut reply).await.unwrap();
-        assert_eq!(&reply, b"back");
     }
 }

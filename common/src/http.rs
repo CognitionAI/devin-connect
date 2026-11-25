@@ -172,7 +172,9 @@ mod tests {
             .await
             .unwrap();
         let read = tokio::spawn(async move { read_head(&mut server, 1024).await.unwrap() });
+        tokio::task::yield_now().await;
         client.write_all(b"\nhello").await.unwrap();
+        drop(client);
         let head = read.await.unwrap();
         assert_eq!(head.head(), b"CONNECT a:1 HTTP/1.1\r\n\r\n");
         assert_eq!(head.leftover(), b"hello");

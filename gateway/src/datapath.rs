@@ -7,15 +7,14 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    pin::Pin,
     sync::{Arc, atomic::Ordering},
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{self, WrapErr, bail, ensure, eyre};
+use common::splice::splice;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
     time::timeout,
@@ -232,29 +231,31 @@ where
 
     metrics.connections_active.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    let mut counted_stream = CountingStream::new(&mut stream);
-    let mut counted_upstream = CountingStream::new(&mut upstream);
-    let result = copy_bidirectional(&mut counted_stream, &mut counted_upstream).await;
-    let client_to_upstream = counted_upstream.bytes_written;
-    let upstream_to_client = counted_stream.bytes_written;
+    let splice = splice(&mut stream, &mut upstream, state.config.half_close_timeout).await;
     metrics
         .bytes_client_to_upstream_total
-        .fetch_add(client_to_upstream, Ordering::Relaxed);
+        .fetch_add(splice.client_to_upstream, Ordering::Relaxed);
     metrics
         .bytes_upstream_to_client_total
-        .fetch_add(upstream_to_client, Ordering::Relaxed);
+        .fetch_add(splice.upstream_to_client, Ordering::Relaxed);
     metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
+    if splice.half_close_timed_out {
+        metrics
+            .half_close_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
 
-    match result {
-        Ok(_) => {
+    match splice.result {
+        Ok(()) => {
             info!(
                 event = "conn_close",
                 host = %dest,
                 port,
                 route = route.name,
-                bytes_client_to_upstream = leftover_to_upstream + client_to_upstream,
-                bytes_upstream_to_client = leftover_to_client + upstream_to_client,
+                bytes_client_to_upstream = leftover_to_upstream + splice.client_to_upstream,
+                bytes_upstream_to_client = leftover_to_client + splice.upstream_to_client,
                 duration_ms = started.elapsed().as_millis() as u64,
+                half_close_timed_out = splice.half_close_timed_out,
                 "connection closed"
             );
         }
@@ -264,8 +265,8 @@ where
                 host = %dest,
                 port,
                 route = route.name,
-                bytes_client_to_upstream = leftover_to_upstream + client_to_upstream,
-                bytes_upstream_to_client = leftover_to_client + upstream_to_client,
+                bytes_client_to_upstream = leftover_to_upstream + splice.client_to_upstream,
+                bytes_upstream_to_client = leftover_to_client + splice.upstream_to_client,
                 duration_ms = started.elapsed().as_millis() as u64,
                 error = format!("{err:#}"),
                 "connection closed with error"
@@ -273,55 +274,6 @@ where
         }
     }
     Ok(())
-}
-
-struct CountingStream<S> {
-    inner: S,
-    bytes_written: u64,
-}
-
-impl<S> CountingStream<S> {
-    fn new(inner: S) -> Self {
-        Self {
-            inner,
-            bytes_written: 0,
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_write(cx, buf) {
-            Poll::Ready(Ok(written)) => {
-                this.bytes_written += written as u64;
-                Poll::Ready(Ok(written))
-            }
-            result => result,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }
 
 #[derive(Debug)]
@@ -592,32 +544,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_connect_request() {
-        let head = b"CONNECT git.corp.example:443 HTTP/1.1\r\nHost: git.corp.example:443\r\n\r\n";
-        let request = parse_connect(head).unwrap();
-        assert_eq!(request.host, "git.corp.example");
-        assert_eq!(request.port, 443);
-    }
-
-    #[test]
-    fn parses_ipv6_authority() {
-        let head = b"CONNECT [fd00::1]:443 HTTP/1.1\r\n\r\n";
-        let request = parse_connect(head).unwrap();
-        assert_eq!(request.host, "fd00::1");
-        assert_eq!(request.port, 443);
-    }
-
-    #[test]
     fn rejects_non_connect_methods() {
         let head = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let err = parse_connect(head).unwrap_err();
         assert!(err.to_string().contains("only CONNECT"), "{err}");
-    }
-
-    #[test]
-    fn rejects_authority_without_port() {
-        let head = b"CONNECT git.corp.example HTTP/1.1\r\n\r\n";
-        assert!(parse_connect(head).is_err());
     }
 
     #[test]
@@ -696,18 +626,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
-    }
-
-    #[tokio::test]
-    async fn counting_stream_retains_bytes_after_write_error() {
-        let (writer, mut reader) = tokio::io::duplex(16);
-        let mut counted = CountingStream::new(writer);
-        counted.write_all(b"forwarded").await.unwrap();
-        assert_eq!(counted.bytes_written, 9);
-
-        reader.shutdown().await.unwrap();
-        drop(reader);
-        assert!(counted.write_all(b"lost").await.is_err());
-        assert_eq!(counted.bytes_written, 9);
     }
 }

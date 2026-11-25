@@ -8,6 +8,7 @@ pub mod http;
 pub mod logging;
 pub mod net;
 pub mod prometheus;
+pub mod splice;
 
 use std::path::Path;
 

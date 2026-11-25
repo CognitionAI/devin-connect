@@ -608,3 +608,57 @@ routes:
     assert_eq!(status, "HTTP/1.1 403 Forbidden");
     assert_eq!(gw.metrics.config_version.load(Ordering::Relaxed), 2);
 }
+
+/// A TCP server that reads to EOF and then holds the connection open,
+/// never answering and never closing.
+async fn spawn_never_closing_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink).await;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn closes_half_closed_connection_when_upstream_never_closes() {
+    let upstream = spawn_never_closing_server().await;
+    let gw = start_gateway(
+        r#"
+schema_version: 1
+listen: 127.0.0.1:0
+admin_listen: 127.0.0.1:1
+half_close_timeout: 200ms
+routes:
+  - name: local
+    rules: [{ipv4: 127.0.0.0/8}]
+"#,
+    )
+    .await;
+
+    let (status, mut stream) = connect(gw.addr, &format!("127.0.0.1:{}", upstream.port())).await;
+    assert_eq!(status, "HTTP/1.1 200 Connection established");
+    stream.write_all(b"request").await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut rest),
+    )
+    .await
+    .expect("gateway kept the half-closed connection open")
+    .unwrap();
+    assert_eq!(gw.metrics.connections_active.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        gw.metrics.half_close_timeouts_total.load(Ordering::Relaxed),
+        1
+    );
+}

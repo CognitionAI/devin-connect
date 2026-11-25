@@ -16,4 +16,4 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 tunnel = { path = "../tunnel" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

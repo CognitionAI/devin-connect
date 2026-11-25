@@ -26,4 +26,4 @@ tunnel = { path = "../tunnel" }
 webpki-roots = "1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "test-util"] }
+tokio = { workspace = true, features = ["rt"] }

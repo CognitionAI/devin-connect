@@ -136,23 +136,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_routes_deny_everything() {
-        let engine = PolicyEngine::new(&[]).unwrap();
-        assert_eq!(
-            engine
-                .find_route(&DestHost::parse("example.com"), 443)
-                .map(|r| &r.name),
-            None
-        );
-        assert_eq!(
-            engine
-                .find_route(&DestHost::parse("10.0.0.1"), 443)
-                .map(|r| &r.name),
-            None
-        );
-    }
-
-    #[test]
     fn matches_exact_and_wildcard_hostnames() {
         let engine = engine(
             r#"

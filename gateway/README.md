@@ -48,6 +48,11 @@ admin_listen: 127.0.0.1:9090
 # proxy port.
 # listen: 0.0.0.0:8443
 
+# Once one side of a connection has finished sending, close the connection
+# when the other side stays silent for this long (default 5m). A peer that
+# never closes would otherwise hold its sockets open forever. `0s` disables.
+# half_close_timeout: 5m
+
 # Customer DNS for resolving route targets (system resolver if omitted).
 dns:
   nameservers: ["10.0.0.2:53"]

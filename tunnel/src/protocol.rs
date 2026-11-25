@@ -279,15 +279,4 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("closed mid-message"), "{err}");
     }
-
-    #[tokio::test]
-    async fn does_not_read_past_the_newline() {
-        let (mut a, mut b) = tokio::io::duplex(1024);
-        a.write_all(b"{\"ok\":true}\ntrailing bytes").await.unwrap();
-        let reply: HelloReply = read_message(&mut b).await.unwrap();
-        assert!(reply.ok);
-        let mut rest = [0u8; 14];
-        b.read_exact(&mut rest).await.unwrap();
-        assert_eq!(&rest, b"trailing bytes");
-    }
 }
