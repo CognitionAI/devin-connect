@@ -17,7 +17,8 @@ use std::{
 };
 
 use color_eyre::eyre::{self, WrapErr, bail, ensure, eyre};
-use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -97,7 +98,7 @@ impl TunnelClient {
                 let pem = tokio::fs::read(&path).await.wrap_err_with(|| {
                     format!("failed to read tunnel ca_file {}", path.display())
                 })?;
-                for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                for cert in CertificateDer::pem_slice_iter(&pem) {
                     let cert = cert.wrap_err_with(|| {
                         format!("invalid certificate in tunnel ca_file {}", path.display())
                     })?;

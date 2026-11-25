@@ -108,7 +108,7 @@ pub struct RouteConfig {
     pub name: String,
 
     /// Destination match rules; the route matches if any rule matches.
-    #[serde(with = "serde_yaml::with::singleton_map_recursive")]
+    #[serde(with = "serde_norway::with::singleton_map_recursive")]
     pub rules: Vec<RouteRule>,
 
     /// Allowed destination ports. Omitted means any port.
@@ -248,7 +248,7 @@ fn default_max_streams_per_connection() -> usize {
 impl GatewayConfig {
     /// Parse and strictly validate a config document from YAML.
     pub fn parse(yaml: &str) -> eyre::Result<Self> {
-        let config: Self = serde_yaml::from_str(yaml).wrap_err("failed to parse config")?;
+        let config: Self = serde_norway::from_str(yaml).wrap_err("failed to parse config")?;
         config.validate()?;
         Ok(config)
     }
